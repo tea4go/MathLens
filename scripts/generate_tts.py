@@ -29,6 +29,8 @@ import os
 import csv
 import json
 import re
+import shutil
+import subprocess
 import asyncio
 from pathlib import Path
 
@@ -52,6 +54,39 @@ VOICE_MAP = {
 }
 
 
+def get_ffmpeg():
+    """定位 ffmpeg：优先 PATH，其次 imageio-ffmpeg 自带的二进制"""
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        return None
+
+
+def to_real_wav(src, dst):
+    """把 edge-tts 输出的 MP3 流转成真正的 PCM WAV。
+
+    manim 假定 .wav 后缀的文件就是真 WAV，会跳过转码直接交给 pydub；
+    而 pydub 探测文件依赖 ffprobe（本项目未提供），于是直接报错。
+    因此必须在生成阶段就转成真正的 WAV。
+    """
+    ffmpeg = get_ffmpeg()
+    if not ffmpeg:
+        return False
+    try:
+        subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", str(src),
+             "-acodec", "pcm_s16le", str(dst)],
+            check=True, capture_output=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, OSError):
+        return False
+
+
 async def generate_audio(text, output_path, voice='xiaoxiao'):
     """
     生成单条音频并捕获 WordBoundary 同步数据。
@@ -61,21 +96,33 @@ async def generate_audio(text, output_path, voice='xiaoxiao'):
         sync_points: 句级同步点列表 [{idx, text, time}, ...]
     """
     voice_id = VOICE_MAP.get(voice, VOICE_MAP['xiaoxiao'])
+    output_path = Path(output_path)
+    want_wav = output_path.suffix.lower() == '.wav'
+    # edge-tts 只能输出 MP3 流；目标是 .wav 时先写临时文件，随后转码
+    tmp_path = output_path.with_name(output_path.name + ".tmp.mp3") if want_wav else output_path
 
     try:
         communicate = edge_tts.Communicate(text, voice_id)
         word_boundaries = []
 
-        with open(output_path, "wb") as f:
+        with open(tmp_path, "wb") as f:
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
                     f.write(chunk["data"])
-                elif chunk["type"] == "WordBoundary":
+                elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
                     word_boundaries.append({
                         "text": chunk["text"],
                         "offset": round(chunk["offset"] / 1e7, 3),
                         "duration": round(chunk["duration"] / 1e7, 3),
+                        "type": chunk["type"],
                     })
+
+        if want_wav:
+            if to_real_wav(tmp_path, output_path):
+                tmp_path.unlink(missing_ok=True)
+            else:
+                print("  Warning: ffmpeg 转码失败，音频保留 MP3 内容（manim 可能无法加载）")
+                shutil.move(str(tmp_path), str(output_path))
 
         duration = get_audio_duration(output_path)
         sync_points = build_sentence_sync_points(text, word_boundaries)
@@ -122,6 +169,14 @@ def build_sentence_sync_points(original_text, word_boundaries):
     """
     if not word_boundaries:
         return []
+
+    # 中文语音返回句级事件，其 offset 即该句起始时间，可直接使用
+    sentence_events = [b for b in word_boundaries if b.get("type") == "SentenceBoundary"]
+    if sentence_events:
+        return [
+            {"idx": i, "text": b["text"][:40], "time": b["offset"]}
+            for i, b in enumerate(sentence_events)
+        ]
 
     sentences = re.split(r'[。！？!?]+', original_text)
     sentences = [s.strip() for s in sentences if s.strip()]

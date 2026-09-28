@@ -62,8 +62,8 @@ class MathScene(Scene):
         self._current_scene_name = ""
         self._scene_start_time = 0.0
         self._audio_safety_margin = 0.2
-        self._audio_data = self._load_audio_data()
         self._sync_points = {}  # {scene_num: [{idx, text, time}, ...]}
+        self._audio_data = self._load_audio_data()
 
     # ========== 3. 音频管理 ==========
     def _load_audio_data(self):

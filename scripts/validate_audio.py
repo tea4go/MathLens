@@ -187,14 +187,37 @@ def validate_audio_files(audio_list, audio_dir):
 
 
 def generate_audio_info_json(updated_list, audio_dir):
-    """生成 audio_info.json 文件"""
-    output = {
-        'files': updated_list,
-        'total_duration': sum(item.get('duration', 0) or 0 for item in updated_list),
-        'count': len(updated_list)
-    }
-
+    """生成 audio_info.json（保留 generate_tts.py 写入的句级同步点）"""
     output_path = os.path.join(audio_dir, 'audio_info.json')
+
+    # 分镜表格里没有同步点信息，直接重建会把 TTS 阶段的 sync_points 冲掉
+    prev_sync = {}
+    prev_voice = None
+    if os.path.exists(output_path):
+        try:
+            with open(output_path, 'r', encoding='utf-8') as f:
+                prev = json.load(f)
+            prev_voice = prev.get('voice')
+            for item in prev.get('files', []):
+                prev_sync[item.get('file')] = item.get('sync_points') or []
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    files = []
+    for item in updated_list:
+        entry = dict(item)
+        if not entry.get('sync_points'):
+            entry['sync_points'] = prev_sync.get(entry.get('file'), [])
+        files.append(entry)
+
+    output = {
+        'files': files,
+        'total_duration': sum(item.get('duration', 0) or 0 for item in files),
+        'count': len(files),
+    }
+    if prev_voice:
+        output['voice'] = prev_voice
+
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 

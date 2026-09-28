@@ -28,22 +28,23 @@ from pathlib import Path
 class RenderPipeline:
     """渲染流水线"""
 
+    # 档位 -> (manim -q 参数, 输出目录名)
     QUALITY_MAP = {
-        'l': '480p15',
-        'low': '480p15',
-        'm': '720p30',
-        'medium': '720p30',
-        'h': '1080p60',
-        'high': '1080p60',
-        'k': '2160p60',
-        '4k': '2160p60',
+        'l': ('l', '480p15'),
+        'low': ('l', '480p15'),
+        'm': ('m', '720p30'),
+        'medium': ('m', '720p30'),
+        'h': ('h', '1080p60'),
+        'high': ('h', '1080p60'),
+        'k': ('k', '2160p60'),
+        '4k': ('k', '2160p60'),
     }
 
     def __init__(self, script_file='script.py', scene_name='MathScene',
                  quality='high', preview=True, skip_check=False):
         self.script_file = Path(script_file)
         self.scene_name = scene_name
-        self.quality = self.QUALITY_MAP.get(quality, '1080p60')
+        self.quality_flag, self.quality = self.QUALITY_MAP.get(quality, ('h', '1080p60'))
         self.preview = preview
         self.skip_check = skip_check
 
@@ -88,7 +89,7 @@ class RenderPipeline:
         cmd = ['manim']
 
         # 质量参数
-        cmd.extend(['-q', self.quality[0]])  # l/m/h/k
+        cmd.extend(['-q', self.quality_flag])
 
         # 预览参数
         if self.preview:
