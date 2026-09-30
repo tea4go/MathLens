@@ -6,24 +6,28 @@ MathLens 端到端流水线
 输出：一支带配音的 Manim 教学视频 (mp4)
 
 用法：
-    python pipeline.py <题目照片> [-o 输出目录] [-q 质量档位]
+    python pipeline.py <题目照片> [-o 输出目录] [-q 质量档位] [-g 年级]
 
 示例：
-    python pipeline.py resource/input.png
+    python pipeline.py resource/input1.png
     python pipeline.py 题目.jpg -o output/我的题目 -q h
+    python pipeline.py 题目.jpg -g 八上        # 只用苏科版八年级上册及之前的知识讲
 
 流程：
     ① 准备工作目录
     ② claude -p 读照片 → 分镜.md + audio_list.csv      [LLM]
-    ③ generate_tts.py  → audio/*.wav + audio_info.json  [脚本]
-    ④ validate_audio.py → 回写时长 + 打印同步点          [脚本]
-    ⑤ claude -p 读分镜 + 同步点 → script.py             [LLM]
-    ⑥ check.py                                          [脚本]
-    ⑦ manim 渲染 → output.mp4（失败回喂错误重试）        [脚本 + LLM]
+    ③ 审计解法是否超出所学范围（超范围则带反馈重做②）    [LLM]
+    ④ generate_tts.py  → audio/*.wav + audio_info.json  [脚本]
+    ⑤ validate_audio.py → 回写时长 + 打印同步点          [脚本]
+    ⑥ claude -p 读分镜 + 同步点 → script.py             [LLM]
+    ⑦ check.py                                          [脚本]
+    ⑧ manim 渲染 → output.mp4（失败回喂错误重试）        [脚本 + LLM]
 """
 
 import argparse
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -39,6 +43,148 @@ STORYBOARD_FILE = "分镜.md"
 CSV_FILE = "audio_list.csv"
 SCRIPT_FILE = "script.py"
 SCENE_CLASS = "MathScene"
+
+# 各学段的可用/禁用数学工具，用来约束 LLM 选用的解法
+GRADE_TOOLKITS = {
+    "小学": {
+        "allowed": "四则运算与运算律、分数/小数/百分数、比与比例、简易方程（五年级起）、"
+                   "平面图形的周长与面积（长方形、正方形、三角形、平行四边形、梯形、圆）、"
+                   "立体图形的表面积与体积（长方体、正方体、圆柱）、图形的平移/旋转/轴对称、"
+                   "用数对表示位置、统计图表与平均数",
+        "forbidden": "勾股定理、三角函数、相似三角形、全等三角形的严格证明、"
+                     "平面直角坐标系与函数、根号与无理数、向量、"
+                     "以及任何需要字母代数式复杂变形的推导",
+        "style": "只用具体数值计算，不做一般性代数证明；"
+                 "几何结论用「观察 + 度量 + 归纳」的方式说明",
+    },
+    "初中": {
+        "allowed": "实数（含二次根式）、整式与分式运算、一元一次/二元一次/一元二次方程、"
+                   "不等式（组）、一次函数/二次函数/反比例函数、平面直角坐标系、"
+                   "全等三角形、相似三角形、勾股定理、锐角三角函数（九年级）、"
+                   "圆（垂径定理、圆周角、切线）、图形的平移/旋转/轴对称、统计与概率初步",
+        "forbidden": "平面向量、导数、三角恒等变换与正弦/余弦定理、复数、空间向量、"
+                     "解析几何的直线与圆锥曲线方程",
+        "style": "几何证明可用全等/相似/勾股；代数可用方程与函数；"
+                 "立体几何不要用向量或坐标法，用传统综合法",
+    },
+    "高中": {
+        "allowed": "集合与常用逻辑、函数与导数、三角函数与恒等变换、解三角形、数列、"
+                   "不等式、平面向量、立体几何（含空间向量）、"
+                   "解析几何（直线、圆、圆锥曲线）、计数原理与概率统计",
+        "forbidden": "大学及以上内容（微积分进阶、线性代数、复变函数等）",
+        "style": "优先选与题目所属模块最基础的方法；"
+                 "能用初中方法解决的，不必上向量或导数",
+    },
+}
+
+# 长的关键词要排在前面，否则「高一年级」会先撞上「一年级」
+GRADE_KEYS = (
+    ("高中", ("高中", "高一", "高二", "高三")),
+    ("初中", ("初中", "初一", "初二", "初三", "七年级", "八年级", "九年级",
+              "七上", "七下", "八上", "八下", "九上", "九下")),
+    ("小学", ("小学", "一年级", "二年级", "三年级", "四年级", "五年级", "六年级")),
+)
+
+
+def resolve_grade(grade):
+    """把「初二」「小学五年级」这类输入归到学段；识别不了返回 None"""
+    if not grade:
+        return None
+    g = grade.strip()
+    for band, keys in GRADE_KEYS:
+        if any(k in g for k in keys):
+            return band
+    return None
+
+
+# ========== 知识库（苏科版教材知识点笔记） ==========
+#
+# 笔记按册存放（七上/七下/…/九下），每册含 `## 第N章 章名` 与 `### N.M 节名` 两级标题。
+# 章号在各册间重复，因此骨架必须带册别前缀，否则 LLM 无法判断「第3章」是哪一册的。
+
+KB_DIR_ENV = "MATHLENS_KB_DIR"
+KB_DIR_FALLBACK = Path(r"C:\SyncData\WhaleNotes\云上笔记\教育学习")
+
+VOLUME_ORDER = ("7上", "7下", "8上", "8下", "9上", "9下")
+
+VOLUME_FILE_RE = re.compile(r"(\d)\s*年级\s*(上|下)\s*册")
+CHAPTER_RE = re.compile(r"^##\s*第(\d+)章\s*(.+?)\s*$")
+APPENDIX_RE = re.compile(r"^##\s*附录[：:]\s*(.+?)\s*$")
+SECTION_RE = re.compile(r"^###\s*(\d+\.\d+)\s*(.+?)\s*$")
+
+# 具体册别关键词，长的排前面，避免「八上」被「八」抢先
+VOLUME_KEYS = (
+    ("9下", ("9下", "九下", "九年级下", "初三下")),
+    ("9上", ("9上", "九上", "九年级上", "初三上")),
+    ("8下", ("8下", "八下", "八年级下", "初二下")),
+    ("8上", ("8上", "八上", "八年级上", "初二上")),
+    ("7下", ("7下", "七下", "七年级下", "初一下")),
+    ("7上", ("7上", "七上", "七年级上", "初一上")),
+)
+
+# 学年/学段 → 该阶段结束时所学的最后一册
+GRADE_END_VOLUME = (
+    ("9下", ("初中", "初三", "九年级", "中考")),
+    ("8下", ("初二", "八年级")),
+    ("7下", ("初一", "七年级")),
+)
+
+
+def resolve_volumes(grade):
+    """把「初二」「八上」展开成累计册别列表（含此前所有册）；识别不了返回 None
+
+    「八上」→ 七上 七下 八上（学生此时已学完初一）
+    「初二」→ 七上 七下 八上 八下（学年结束）
+    """
+    if not grade:
+        return None
+    g = grade.strip()
+    for vol, keys in VOLUME_KEYS + GRADE_END_VOLUME:
+        if any(k in g for k in keys):
+            return list(VOLUME_ORDER[:VOLUME_ORDER.index(vol) + 1])
+    return None
+
+
+def resolve_kb_dir():
+    """知识库目录：环境变量优先，其次默认路径；都不可用返回 None"""
+    env = os.environ.get(KB_DIR_ENV)
+    if env:
+        p = Path(env)
+        if p.is_dir():
+            return p
+        log(f"⚠ {KB_DIR_ENV}={env} 不是有效目录，改用默认路径")
+    return KB_DIR_FALLBACK if KB_DIR_FALLBACK.is_dir() else None
+
+
+def load_kb_index(kb_dir):
+    """扫描知识库目录，返回 {册别: {"title": 册名, "outline": 章/节骨架文本}}"""
+    index = {}
+    for md in sorted(Path(kb_dir).glob("*.md")):
+        m = VOLUME_FILE_RE.search(md.name)
+        if not m:
+            continue
+        title, lines = md.stem, []
+        for raw in md.read_text(encoding="utf-8").splitlines():
+            line = raw.rstrip()
+            if line.startswith("# "):
+                title = line[2:].strip()
+            elif (cm := CHAPTER_RE.match(line)):
+                lines.append(f"第{cm.group(1)}章 {cm.group(2)}")
+            elif (am := APPENDIX_RE.match(line)):
+                lines.append(f"附录：{am.group(1)}")
+            elif (sm := SECTION_RE.match(line)):
+                lines.append(f"  {sm.group(1)} {sm.group(2)}")
+        if lines:
+            index[f"{m.group(1)}{m.group(2)}"] = {"title": title, "outline": "\n".join(lines)}
+    return index
+
+
+def build_scope_text(index, volumes):
+    """把指定册别的骨架拼成给 LLM 的范围清单"""
+    return "\n\n".join(
+        f"【{index[v]['title']}】\n{index[v]['outline']}"
+        for v in volumes if v in index
+    )
 
 
 # ========== 输出工具 ==========
@@ -123,14 +269,71 @@ def run(cmd, cwd, timeout=None):
 # ========== 各步骤 ==========
 
 def step_prepare(workdir):
-    section("步骤 1/7 · 准备工作目录")
+    section("步骤 1/8 · 准备工作目录")
     for sub in ("audio", "media", "assets"):
         (workdir / sub).mkdir(parents=True, exist_ok=True)
     log(f"工作目录: {workdir}")
 
 
-def step_storyboard(image, workdir, timeout):
-    section("步骤 2/7 · 分析题目并生成分镜（LLM）")
+def step_storyboard(image, workdir, timeout, grade="不限", kb_scope=None, feedback=""):
+    section("步骤 2/8 · 分析题目并生成分镜（LLM）")
+
+    band = resolve_grade(grade)
+    if kb_scope:
+        grade_section = f"""
+## 一、学情约束（最重要，必须遵守）
+本视频面向【{grade}】的学生。下面列出该学段**已经学过**的全部教材章节，
+解题只能用这些章节里的知识，**不得使用清单之外的任何定理、方法或公式**。
+
+{kb_scope}
+
+【讲解风格】
+优先用最基础、最直观的方法；能一步算出来的不要绕两步。
+
+如果这道题确实用清单内的知识解不了，就退一步，选一个最接近该学段、
+最基础的方法来讲，并在开场读白里用一句话点明需要补充的新知识，
+不要让观众一上来就面对完全陌生的工具。
+"""
+    elif grade and grade.strip() != "不限":
+        if band:
+            kit = GRADE_TOOLKITS[band]
+            grade_section = f"""
+## 一、学情约束（最重要，必须遵守）
+本视频面向【{grade}】的学生，解题只能用该学段已经学过的知识。
+
+【可用工具】
+{kit['allowed']}
+
+【绝对不要使用】
+{kit['forbidden']}
+
+【讲解风格】
+{kit['style']}
+
+如果这道题用【{grade}】的知识确实解不了，就退一步，选一个最接近该学段、
+最基础的方法来讲，并在开场读白里用一句话点明需要补充的新知识，
+不要让观众一上来就面对完全陌生的工具。
+"""
+        else:
+            log(f"⚠ 无法识别年级「{grade}」属于哪个学段，只按字面约束，不附加工具清单")
+            grade_section = f"""
+## 一、学情约束（必须遵守）
+本视频面向【{grade}】的学生，解题只能使用该年级已经学过的知识，
+不要使用更高学段的工具和方法。
+"""
+    else:
+        grade_section = """
+## 一、学情约束
+不限学段。可以用任何恰当的方法，但优先选择最基础、最直观的解法。
+"""
+
+    if feedback:
+        grade_section = f"""## 零、上一版被打回的原因（必须修正）
+上一版分镜用了超出所学范围的知识，请换用清单内的等价方法重做：
+{feedback}
+
+""" + grade_section
+
     prompt = f"""你是一位资深的数学教学视频分镜师。请为下面这道数学题制作一支教学视频的分镜。
 
 【题目图片】{image}
@@ -138,15 +341,15 @@ def step_storyboard(image, workdir, timeout):
 
 【工作目录】{workdir}
 请在当前工作目录下创建文件。
-
-## 一、先做数学分析
+{grade_section}
+## 二、先做数学分析
 - 读懂题目，明确已知条件和待求结论
 - 推导解题所需的数学事实
 - 如果是几何题，确定几何模型的构建方法，给出关键点的具体坐标
   （坐标系建议：图形放在 (-5,5) × (-4,4) 区域内，中心尽量靠近原点）
 
-## 二、创建 {STORYBOARD_FILE}
-必须严格包含以下三个部分，格式不能变：
+## 三、创建 {STORYBOARD_FILE}
+必须严格包含以下四个部分，格式不能变：
 
 # 分镜脚本 - <题目名称>
 
@@ -173,7 +376,22 @@ def step_storyboard(image, workdir, timeout):
 | 幕号 | 音频时长 | 动画时长 | 说明 |
 |------|----------|----------|------|
 
-## 三、创建 {CSV_FILE}
+## 解题方法清单
+
+把这道题的解法**拆成一条条独立的数学事实**，逐条列出它用到的定理/方法：
+（这一节会被审核，用来确认没有超出学生所学范围，务必如实填写）
+
+| # | 用到的定理/方法 | 教材出处（第几册第几章） | 用在哪一步 |
+|---|----------------|------------------------|-----------|
+| 1 | 全等三角形 SSS 判定 | 八上 第1章 | 证明 △ABD ≌ △ACE |
+| 2 | 勾股定理的逆定理 | 八上 第3章 | 由三边平方和判断直角 |
+
+填写要求：
+- 只写**真正用到的**定理/方法，不要罗列无关知识凑数
+- 「教材出处」写你判断的册别和章节；不确定就写「不确定」
+- 如果用了清单外的知识（比如更高的学段的方法），必须如实写出来，不要隐瞒
+
+## 四、创建 {CSV_FILE}
 两列表头为 filename,text，内容必须与上面「音频生成清单」的文件名和读白**逐字一致**：
 
 filename,text
@@ -201,8 +419,95 @@ audio_001_开场.wav,"大家好！今天我们来..."
     log(f"✓ {CSV_FILE}")
 
 
+def extract_json(text):
+    """从 LLM 输出里抠出第一个 JSON 对象；失败返回 None"""
+    if not text:
+        return None
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def audit_storyboard(workdir, index, volumes, timeout):
+    """让 LLM 逐条比对「解题方法清单」与教材范围；返回 {"verdict","items"} 或 None"""
+    allowed = "、".join(volumes)
+    full_map = "\n\n".join(
+        f"【{index[v]['title']}】\n{index[v]['outline']}"
+        for v in VOLUME_ORDER if v in index
+    )
+
+    prompt = f"""你是教材范围审核员。请审核一份数学教学视频分镜，判断它的解法是否超出学生已学范围。
+
+【学生已学范围】{allowed}（共 {len(volumes)} 册）—— 只有这些册里的知识可用
+{build_scope_text(index, volumes)}
+
+【完整教材地图】下面是初中六册的全部章节，用来判断某个知识点究竟属于哪一册
+{full_map}
+
+【待审核文件】{workdir / STORYBOARD_FILE}
+请用 Read 工具读取，重点看「## 解题方法清单」那一节的表格。
+
+【任务】
+对表格里的每一条，判断它属于哪一册：
+- 属于 {allowed} 中某一册 → ok = true
+- 属于更靠后的册（学生还没学）→ ok = false
+- 不在教材地图里的方法（超纲技巧、更高学段内容）→ ok = false
+
+【输出】只输出一个 JSON 对象，前后不要有任何其他文字：
+{{"verdict": "pass", "items": [{{"method": "勾股定理的逆定理", "volume": "8上", "ok": true, "reason": "八年级上册第3章，已学"}}]}}
+
+判定从严：拿不准的判为 false，并在 reason 里说明拿不准。"""
+
+    result = extract_json(call_claude(prompt, workdir, timeout, "范围审计"))
+    if result is None:
+        log("⚠ 审计输出无法解析为 JSON")
+    return result
+
+
+def step_storyboard_guarded(image, workdir, timeout, grade, index, volumes, max_retries):
+    """生成分镜 → 审计 → 超范围则带反馈重做；未启用知识库时直接生成"""
+    kb_scope = build_scope_text(index, volumes) if (index and volumes) else None
+    if not kb_scope:
+        step_storyboard(image, workdir, timeout, grade)
+        return
+
+    feedback = ""
+    for attempt in range(max_retries + 1):
+        step_storyboard(image, workdir, timeout, grade, kb_scope, feedback)
+
+        section("步骤 3/8 · 审计解法是否超出所学范围（LLM）")
+        result = audit_storyboard(workdir, index, volumes, timeout)
+        if result is None:
+            log("⚠ 跳过审计，沿用当前分镜")
+            return
+
+        items = result.get("items", [])
+        bad = [i for i in items if not i.get("ok", True)]
+        if result.get("verdict") == "pass" and not bad:
+            log(f"✓ 范围审计通过（{len(items)} 条方法全部在范围内）")
+            return
+
+        log(f"✗ 范围审计未通过，{len(bad)} 条超范围")
+        for i in bad:
+            log(f"  · {i.get('method', '?')}（{i.get('volume', '?')}）: {i.get('reason', '')}")
+
+        if attempt >= max_retries:
+            log(f"⚠ 已重做 {max_retries} 次仍未通过，沿用当前分镜继续（建议人工检查）")
+            return
+
+        log(f"回喂审计结果，重做分镜（第 {attempt + 1}/{max_retries} 次）...")
+        feedback = "\n".join(
+            f"- {i.get('method', '?')}：{i.get('reason', '')}（判断属于 {i.get('volume', '?')}）"
+            for i in bad
+        )
+
+
 def step_tts(workdir, voice, timeout):
-    section("步骤 3/7 · 生成配音音频（edge-tts）")
+    section("步骤 4/8 · 生成配音音频（edge-tts）")
     proc = run(
         [sys.executable, str(SCRIPTS_DIR / "generate_tts.py"),
          CSV_FILE, "./audio", "--voice", voice],
@@ -226,7 +531,7 @@ def step_tts(workdir, voice, timeout):
 
 
 def step_validate(workdir):
-    section("步骤 4/7 · 校验音频并回写分镜时长")
+    section("步骤 5/8 · 校验音频并回写分镜时长")
     proc = run(
         [sys.executable, str(SCRIPTS_DIR / "validate_audio.py"),
          STORYBOARD_FILE, "./audio"],
@@ -238,7 +543,7 @@ def step_validate(workdir):
 
 
 def step_script(workdir, timeout):
-    section("步骤 5/7 · 生成 Manim 动画代码（LLM）")
+    section("步骤 6/8 · 生成 Manim 动画代码（LLM）")
     prompt = f"""你是 Manim 动画工程师，请把分镜脚本实现成可渲染的动画代码。
 
 【工作目录】{workdir}
@@ -293,7 +598,7 @@ def step_script(workdir, timeout):
 
 
 def step_check(workdir):
-    section("步骤 6/7 · 代码结构检查")
+    section("步骤 7/8 · 代码结构检查")
     proc = run(
         [sys.executable, str(SCRIPTS_DIR / "check.py"), SCRIPT_FILE],
         cwd=workdir,
@@ -317,7 +622,7 @@ def find_video(workdir):
 
 
 def step_render(workdir, quality, max_retries, timeout):
-    section(f"步骤 7/7 · 渲染视频（质量 -q{quality}）")
+    section(f"步骤 8/8 · 渲染视频（质量 -q{quality}）")
 
     for attempt in range(1, max_retries + 1):
         log(f"第 {attempt}/{max_retries} 次渲染...")
@@ -384,8 +689,16 @@ def main():
                         help="渲染质量 l/m/h/k，默认 m (720p30)")
     parser.add_argument("--voice", default="xiaoxiao",
                         help="配音音色，默认 xiaoxiao")
+    parser.add_argument("-g", "--grade", default="不限",
+                        help="按哪个年级的知识点讲解，如「初二上」「八上」「初二」「小学五年级」；"
+                             "默认 不限（不约束解法）")
+    parser.add_argument("--kb-dir", default=None,
+                        help="教材知识点笔记目录（按册存放的 Markdown）；"
+                             f"默认读环境变量 {KB_DIR_ENV}，再退回内置路径")
     parser.add_argument("--max-retries", type=int, default=3,
                         help="渲染失败重试次数，默认 3")
+    parser.add_argument("--max-audit-retries", type=int, default=2,
+                        help="范围审计不通过时的分镜重做次数，默认 2")
     parser.add_argument("--llm-timeout", type=int, default=1800,
                         help="单次 LLM 调用超时秒数，默认 1800")
     parser.add_argument("--render-timeout", type=int, default=3600,
@@ -400,19 +713,39 @@ def main():
         else (ROOT / "output" / image.stem).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
 
+    # 先解析知识库，好在启动横幅里如实显示本次的范围约束
+    kb_path = Path(args.kb_dir).resolve() if args.kb_dir else resolve_kb_dir()
+    index = load_kb_index(kb_path) if kb_path else {}
+    volumes = resolve_volumes(args.grade) if index else None
+    kb_scope = build_scope_text(index, volumes) if volumes else None
+
     print(f"\n{'=' * 66}")
     print("  MathLens 端到端流水线")
     print(f"{'=' * 66}")
     print(f"  题目图片: {image}")
     print(f"  输出目录: {workdir}")
     print(f"  渲染质量: {args.quality}")
+    band = resolve_grade(args.grade)
     print(f"  配音音色: {args.voice}")
+    print(f"  学情年级: {args.grade}" + (f"（{band}知识范围）" if band else ""))
+    if kb_scope:
+        print(f"  知识库:   {kb_path}")
+        print(f"  范围约束: {'、'.join(volumes)}"
+              f"（{len(volumes)} 册 / {len(kb_scope)} 字，含解题后审计）")
+    elif kb_path and index:
+        print(f"  知识库:   {kb_path}"
+              f"（{len(index)} 册，但「{args.grade}」映射不到册别，本次未启用）")
+    elif kb_path:
+        print(f"  知识库:   {kb_path}（未找到可识别的教材笔记）")
+    else:
+        print("  知识库:   未配置（仅按学段约束解法）")
 
     total_start = time.time()
 
     setup_ffmpeg()
     step_prepare(workdir)
-    step_storyboard(image, workdir, args.llm_timeout)
+    step_storyboard_guarded(image, workdir, args.llm_timeout, args.grade,
+                            index, volumes, args.max_audit_retries)
     step_tts(workdir, args.voice, args.llm_timeout)
     step_validate(workdir)
     step_script(workdir, args.llm_timeout)
